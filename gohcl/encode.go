@@ -6,13 +6,14 @@ import (
 	"sort"
 
 	"github.com/hashicorp/hcl/v2/hclwrite"
+	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/gocty"
 )
 
 // EncodeIntoBody replaces the contents of the given hclwrite Body with
 // attributes and blocks derived from the given value, which must be a
 // struct value or a pointer to a struct value with the struct tags defined
-// in this package.
+// in this package or a map.
 //
 // This function can work only with fully-decoded data. It will ignore any
 // fields tagged as "remain", any fields that decode attributes into either
@@ -40,17 +41,20 @@ func EncodeIntoBody(val interface{}, dst *hclwrite.Body) {
 		rv = rv.Elem()
 		ty = rv.Type()
 	}
-	if ty.Kind() != reflect.Struct {
-		panic(fmt.Sprintf("value is %s, not struct", ty.Kind()))
-	}
 
-	tags := getFieldTags(ty)
-	populateBody(rv, ty, tags, dst)
+	if ty.Kind() == reflect.Map {
+		populateMapBody(rv, ty, dst)
+	} else if ty.Kind() == reflect.Struct {
+		tags := getFieldTags(ty)
+		populateBody(rv, ty, tags, dst)
+	} else {
+		panic(fmt.Sprintf("value is %s, not struct nor map", ty.Kind()))
+	}
 }
 
 // EncodeAsBlock creates a new hclwrite.Block populated with the data from
 // the given value, which must be a struct or pointer to struct with the
-// struct tags defined in this package.
+// struct tags defined in this package or a map.
 //
 // If the given struct type has fields tagged with "label" tags then they
 // will be used in order to annotate the created block with labels.
@@ -64,22 +68,27 @@ func EncodeAsBlock(val interface{}, blockType string) *hclwrite.Block {
 		rv = rv.Elem()
 		ty = rv.Type()
 	}
-	if ty.Kind() != reflect.Struct {
-		panic(fmt.Sprintf("value is %s, not struct", ty.Kind()))
+
+	if ty.Kind() == reflect.Map {
+		block := hclwrite.NewBlock(blockType, nil)
+		populateMapBody(rv, ty, block.Body())
+		return block
+	} else if ty.Kind() == reflect.Struct {
+		tags := getFieldTags(ty)
+		labels := make([]string, len(tags.Labels))
+		for i, lf := range tags.Labels {
+			lv := rv.Field(lf.FieldIndex)
+			// We just stringify whatever we find. It should always be a string
+			// but if not then we'll still do something reasonable.
+			labels[i] = fmt.Sprintf("%s", lv.Interface())
+		}
+
+		block := hclwrite.NewBlock(blockType, labels)
+		populateBody(rv, ty, tags, block.Body())
+		return block
 	}
 
-	tags := getFieldTags(ty)
-	labels := make([]string, len(tags.Labels))
-	for i, lf := range tags.Labels {
-		lv := rv.Field(lf.FieldIndex)
-		// We just stringify whatever we find. It should always be a string
-		// but if not then we'll still do something reasonable.
-		labels[i] = fmt.Sprintf("%s", lv.Interface())
-	}
-
-	block := hclwrite.NewBlock(blockType, labels)
-	populateBody(rv, ty, tags, block.Body())
-	return block
+	panic(fmt.Sprintf("value is %s, not struct nor map", ty.Kind()))
 }
 
 func populateBody(rv reflect.Value, ty reflect.Type, tags *fieldTags, dst *hclwrite.Body) {
@@ -188,4 +197,61 @@ func populateBody(rv reflect.Value, ty reflect.Type, tags *fieldTags, dst *hclwr
 			}
 		}
 	}
+}
+
+func populateMapBody(rv reflect.Value, ty reflect.Type, dst *hclwrite.Body) {
+	if ty.Key().Kind() != reflect.String {
+		panic("keys should be strings")
+	}
+
+	keys := []string{}
+	for _, key := range rv.MapKeys() {
+		keys = append(keys, key.String())
+	}
+	sort.Strings(keys)
+
+	dst.Clear()
+
+	for _, k := range keys {
+		v := rv.MapIndex(reflect.ValueOf(k))
+
+		valTy, err := impliedType(v)
+		if err != nil {
+			panic(fmt.Sprintf("cannot encode %T as HCL expression: %s", v.Interface(), err))
+		}
+
+		val, err := gocty.ToCtyValue(v.Interface(), valTy)
+		if err != nil {
+			// This should never happen, since we should always be able
+			// to decode into the implied type.
+			panic(fmt.Sprintf("failed to encode %T as %#v: %s", v.Interface(), valTy, err))
+		}
+
+		dst.SetAttributeValue(k, val)
+	}
+}
+
+func impliedType(v reflect.Value) (cty.Type, error) {
+	if v.Type().Kind() == reflect.Interface {
+		v = v.Elem()
+	}
+	ty := v.Type()
+	if ty.Kind() == reflect.Slice && v.Len() != 0 && ty.Elem().Kind() == reflect.Interface {
+		ty = v.Index(0).Type()
+		homogeneous := true
+		for i := 1; i < v.Len(); i++ {
+			if ty != v.Index(i).Type() {
+				homogeneous = false
+				break
+			}
+		}
+		if homogeneous {
+			ty, err := gocty.ImpliedType(v.Index(0).Interface())
+			if err != nil {
+				return ty, err
+			}
+			return cty.List(ty), nil
+		}
+	}
+	return gocty.ImpliedType(v.Interface())
 }
